@@ -344,32 +344,32 @@ sqlFromFile fp = do
 -- destroyed per the timeout policy in Data.Pool.
 withExpiringPGconn ::
   (MonadBaseControl IO m, MonadIO m) => PGPool -> (PGConn -> m a) -> m a
-withExpiringPGconn pool f = do
-  -- If the connection was stale, we'll discard it and retry, possibly forcing
-  -- creation of new connection:
-  old <- liftIO getCurrentTime
-  handleLifted (\PGConnectionStale -> withExpiringPGconn pool f) $ do
-    RP.withResource (_pool pool) $ \connRsrc@PGConn {..} -> do
-      now <- liftIO getCurrentTime
-      let microseconds = realToFrac (1000000 * diffUTCTime now old)
-          seconds = realToFrac $ diffUTCTime now old
-      liftIO (EKG.Distribution.add (_poolConnAcquireLatency (_stats pool)) microseconds)
-      liftIO (Histogram.observe (_poolWaitTimeMetric (_metrics pool)) seconds)
-      let connectionStale =
-            any (\lifetime -> now `diffUTCTime` pgCreatedAt > lifetime) pgMbLifetime
-      when connectionStale $ do
-        -- Throwing is the only way to signal to resource pool to discard the
-        -- connection at this time, so we need to use it for control flow:
-        Exc.impureThrow PGConnectionStale
-      -- else proceed with callback:
-      f connRsrc
+withExpiringPGconn pool f = control $ \runInIO -> Exc.mask $ \restore -> do
+  let loop old = do
+        (connRsrc@PGConn {..}, localPool) <- RP.takeResource (_pool pool)
+        now <- getCurrentTime
+        let microseconds = realToFrac (1000000 * diffUTCTime now old)
+            seconds = realToFrac $ diffUTCTime now old
+        EKG.Distribution.add (_poolConnAcquireLatency (_stats pool)) microseconds
+        Histogram.observe (_poolWaitTimeMetric (_metrics pool)) seconds
+        let connectionStale =
+              any (\lifetime -> now `diffUTCTime` pgCreatedAt > lifetime) pgMbLifetime
+        
+        if connectionStale
+          then do
+            -- The connection is stale, destroy it and try to acquire a new one
+            RP.destroyResource (_pool pool) localPool connRsrc
+            loop old
+          else do
+            -- The connection is fresh, run the callback
+            ret <-
+              restore (runInIO (f connRsrc))
+                `Exc.onException` RP.destroyResource (_pool pool) localPool connRsrc
+            RP.releaseResource (_pool pool) localPool connRsrc
+            return ret
 
--- | Used internally (see 'withExpiringPGconn'), but exported in case we need
--- to allow callback to signal that the connection should be destroyed and we
--- should retry.
-data PGConnectionStale = PGConnectionStale
-  deriving stock (Show)
-  deriving anyclass (Exception)
+  old <- getCurrentTime
+  loop old
 
 -- cribbed from lifted-base
 handleLifted :: (MonadBaseControl IO m, Exception e) => (e -> m a) -> m a -> m a
